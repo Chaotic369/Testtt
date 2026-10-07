@@ -158,17 +158,18 @@ jobs:
           fi
 
           echo "Using icon: $ICON"
+
+          # Make sure Pillow is available before Python starts
+          if ! python3 -c "import PIL" 2>/dev/null; then
+            python3 -m pip install --quiet --break-system-packages pillow \
+              || sudo apt-get install -y python3-pil
+          fi
+          python3 -c "import PIL; print('Pillow', PIL.__version__)"
+
           cd "$PROJECT_DIR"
           ICON_PATH="$ICON" python3 - <<'PY'
           import os
-          import subprocess
-          import sys
-
-          try:
-              from PIL import Image
-          except ImportError:
-              subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "pillow"])
-              from PIL import Image
+          from PIL import Image
 
           sizes = {
               "mdpi": 48,
