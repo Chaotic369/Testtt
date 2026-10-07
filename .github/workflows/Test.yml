@@ -1,0 +1,241 @@
+name: WebPaper
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: "App display name"
+        required: false
+        default: "WebPaper"
+        type: string
+      app_version:
+        description: "App version (e.g. 1.0.0)"
+        required: false
+        default: "1.0.0"
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      APP_NAME: ${{ github.event.inputs.app_name || 'WebPaper' }}
+      APP_VERSION: ${{ github.event.inputs.app_version || '1.0.0' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle 8.10.2
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: Accept Android SDK licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Locate Android app module
+        run: |
+          APP_DIR=""
+          candidates="app $(find . -type f \( -name build.gradle.kts -o -name build.gradle \) -not -path './.git/*' -not -path '*/build/*' -exec dirname {} \; | sed 's|^\./||' | sort -u)"
+          for dir in $candidates; do
+            gradle_file=""
+            [ -f "$dir/build.gradle.kts" ] && gradle_file="$dir/build.gradle.kts"
+            [ -z "$gradle_file" ] && [ -f "$dir/build.gradle" ] && gradle_file="$dir/build.gradle"
+            if [ -n "$gradle_file" ] && [ -f "$dir/src/main/AndroidManifest.xml" ] && grep -Eq "android[.]application" "$gradle_file"; then
+              APP_DIR="$dir"
+              break
+            fi
+          done
+          if [ -z "$APP_DIR" ]; then
+            echo "::error::No Android app module found (needs <module>/build.gradle[.kts] with the android application plugin and <module>/src/main/AndroidManifest.xml)."
+            echo "Repository contents:"
+            find . -not -path './.git/*' -not -path './.git' | sort | head -100
+            exit 1
+          fi
+          PROJECT_DIR="$APP_DIR"
+          while [ "$PROJECT_DIR" != "." ] && [ ! -f "$PROJECT_DIR/settings.gradle.kts" ] && [ ! -f "$PROJECT_DIR/settings.gradle" ]; do
+            PROJECT_DIR="$(dirname "$PROJECT_DIR")"
+          done
+          if [ ! -f "$PROJECT_DIR/settings.gradle.kts" ] && [ ! -f "$PROJECT_DIR/settings.gradle" ]; then
+            echo "::error::No settings.gradle[.kts] found at or above $APP_DIR."
+            exit 1
+          fi
+          echo "Using app module: $APP_DIR (Gradle root: $PROJECT_DIR)"
+          echo "APP_DIR=$APP_DIR" >> "$GITHUB_ENV"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Patch app name and version
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          name = os.environ["APP_NAME"].strip()
+          version = os.environ["APP_VERSION"].strip()
+          run_number = int(os.environ.get("GITHUB_RUN_NUMBER", "1"))
+
+          # Derive an integer versionCode from the version: major*10000 + minor*100 + patch.
+          m = re.match(r"^(\d+)(?:\.(\d+))?(?:\.(\d+))?", version)
+          if m:
+              major = int(m.group(1))
+              minor = int(m.group(2) or 0)
+              patch = int(m.group(3) or 0)
+              version_code = major * 10000 + minor * 100 + patch
+              if version_code < 1:
+                  version_code = run_number
+          else:
+              version_code = run_number
+
+          # ---- AndroidManifest.xml: android:label on <application> ----
+          manifest_path = os.path.join(os.environ["APP_DIR"], "src/main/AndroidManifest.xml")
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              manifest = f.read()
+
+          escaped = (
+              name.replace("&", "&amp;")
+              .replace("<", "&lt;")
+              .replace(">", "&gt;")
+              .replace('"', "&quot;")
+          )
+
+          app_tag = re.search(r"<application\b[^>]*>", manifest, re.S)
+          if not app_tag:
+              print("ERROR: <application> tag not found in AndroidManifest.xml")
+              sys.exit(1)
+
+          old_tag = app_tag.group(0)
+          if re.search(r'android:label\s*=\s*"[^"]*"', old_tag):
+              new_tag = re.sub(
+                  r'android:label\s*=\s*"[^"]*"',
+                  lambda _: 'android:label="%s"' % escaped,
+                  old_tag,
+                  count=1,
+              )
+          else:
+              new_tag = old_tag.replace(
+                  "<application", '<application android:label="%s"' % escaped, 1
+              )
+          manifest = manifest.replace(old_tag, new_tag, 1)
+
+          with open(manifest_path, "w", encoding="utf-8") as f:
+              f.write(manifest)
+
+          # ---- module build.gradle(.kts): versionName / versionCode ----
+          gradle_path = os.path.join(os.environ["APP_DIR"], "build.gradle.kts")
+          if not os.path.isfile(gradle_path):
+              gradle_path = os.path.join(os.environ["APP_DIR"], "build.gradle")
+          with open(gradle_path, "r", encoding="utf-8") as f:
+              gradle = f.read()
+
+          gradle, n_name = re.subn(
+              r'versionName\s*=?\s*"[^"]*"',
+              lambda _: 'versionName = "%s"' % version,
+              gradle,
+              count=1,
+          )
+          gradle, n_code = re.subn(
+              r"versionCode\s*=?\s*\d+",
+              lambda _: "versionCode = %d" % version_code,
+              gradle,
+              count=1,
+          )
+
+          if n_name == 0 or n_code == 0:
+              print("ERROR: versionName/versionCode not found in " + gradle_path)
+              sys.exit(1)
+
+          with open(gradle_path, "w", encoding="utf-8") as f:
+              f.write(gradle)
+
+          print("Patched label=%r versionName=%r versionCode=%d" % (name, version, version_code))
+          PY
+
+      - name: Inject launcher icon (if build-icon.png exists)
+        run: |
+          if [ ! -f build-icon.png ]; then
+            echo "build-icon.png not found at repo root; keeping existing icons."
+            exit 0
+          fi
+          pip install --quiet pillow || pip install --quiet --break-system-packages pillow
+          python3 - <<'PY'
+          import os
+          import re
+          from PIL import Image
+
+          sizes = {
+              "mipmap-mdpi": 48,
+              "mipmap-hdpi": 72,
+              "mipmap-xhdpi": 96,
+              "mipmap-xxhdpi": 144,
+              "mipmap-xxxhdpi": 192,
+          }
+
+          res_dir = os.path.join(os.environ["APP_DIR"], "src/main/res")
+          src = Image.open("build-icon.png").convert("RGBA")
+
+          for folder, px in sizes.items():
+              out_dir = os.path.join(res_dir, folder)
+              os.makedirs(out_dir, exist_ok=True)
+              icon = src.resize((px, px), Image.LANCZOS)
+              icon.save(os.path.join(out_dir, "ic_launcher.png"))
+              icon.save(os.path.join(out_dir, "ic_launcher_round.png"))
+
+          # Remove adaptive-icon XMLs and other formats that would conflict with the PNGs.
+          for folder in os.listdir(res_dir):
+              if not folder.startswith("mipmap-"):
+                  continue
+              for base in ("ic_launcher", "ic_launcher_round"):
+                  for ext in (".xml", ".webp"):
+                      path = os.path.join(res_dir, folder, base + ext)
+                      if os.path.isfile(path):
+                          os.remove(path)
+                          print("Removed " + path)
+
+          # Point the manifest at the injected icons.
+          manifest_path = os.path.join(os.environ["APP_DIR"], "src/main/AndroidManifest.xml")
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              manifest = f.read()
+
+          app_tag = re.search(r"<application\b[^>]*>", manifest, re.S)
+          if app_tag:
+              old_tag = app_tag.group(0)
+              new_tag = old_tag
+              for attr, value in (
+                  ("android:icon", "@mipmap/ic_launcher"),
+                  ("android:roundIcon", "@mipmap/ic_launcher_round"),
+              ):
+                  if re.search(attr + r'\s*=\s*"[^"]*"', new_tag):
+                      new_tag = re.sub(
+                          attr + r'\s*=\s*"[^"]*"',
+                          lambda _, a=attr, v=value: '%s="%s"' % (a, v),
+                          new_tag,
+                          count=1,
+                      )
+                  else:
+                      new_tag = new_tag.replace(
+                          "<application", '<application %s="%s"' % (attr, value), 1
+                      )
+              manifest = manifest.replace(old_tag, new_tag, 1)
+              with open(manifest_path, "w", encoding="utf-8") as f:
+                  f.write(manifest)
+
+          print("Icon injected from build-icon.png")
+          PY
+
+      - name: Build debug APK
+        run: |
+          cd "$PROJECT_DIR"
+          gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ github.event.inputs.app_name || 'WebPaper' }}
+          path: ${{ env.APP_DIR }}/build/outputs/apk/**/*debug*.apk
+          if-no-files-found: error
