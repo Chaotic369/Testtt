@@ -1,52 +1,214 @@
-name: build
+name: Test
 
 on:
-  push:
-  pull_request:
   workflow_dispatch:
-
-concurrency:
-  group: build-${{ github.ref }}
-  cancel-in-progress: true
+    inputs:
+      app_name:
+        description: "App name (android:label)"
+        required: false
+        default: "Firing"
+      app_version:
+        description: "App version (versionName)"
+        required: false
+        default: "1.0.0"
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-java@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate Android project root (wrapper folder safe)
+        run: |
+          # Find the folder that contains app/build.gradle.kts (repo root or any wrapper folder)
+          GRADLE_FILE=$(find . -maxdepth 5 -type f -path "*/app/build.gradle.kts" \
+            -not -path "*/node_modules/*" -not -path "*/build/*" | sort | head -n 1)
+
+          if [ -z "$GRADLE_FILE" ]; then
+            echo "ERROR: app/build.gradle.kts not found anywhere in the repository" >&2
+            find . -maxdepth 4 -not -path "./.git/*" | head -n 100
+            exit 1
+          fi
+
+          PROJECT_DIR=$(cd "$(dirname "$(dirname "$GRADLE_FILE")")" && pwd)
+          echo "Android project root: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          if [ ! -f "$PROJECT_DIR/app/src/main/AndroidManifest.xml" ]; then
+            echo "ERROR: AndroidManifest.xml not found in $PROJECT_DIR/app/src/main" >&2
+            exit 1
+          fi
+
+      - name: Set up Java 17 (Temurin)
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: "17"
 
-      - uses: gradle/actions/setup-gradle@v4
+      - name: Set up Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
 
-      - name: Accept Android SDK licences
-        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+      - name: Patch app name and version
+        env:
+          APP_NAME: ${{ github.event.inputs.app_name || 'Firing' }}
+          APP_VERSION: ${{ github.event.inputs.app_version || '1.0.0' }}
+        run: |
+          cd "$PROJECT_DIR"
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
 
-      - name: Make wrapper executable
-        run: chmod +x ./gradlew
+          app_name = os.environ["APP_NAME"]
+          app_version = os.environ["APP_VERSION"]
 
-      - name: Build, lint, test
-        run: ./gradlew assembleDebug lint test --stacktrace
+          # Derive a numeric versionCode from the version string (e.g. 1.2.3 -> 10203)
+          parts = re.findall(r"\d+", app_version)
+          nums = [int(p) for p in parts[:3]]
+          while len(nums) < 3:
+              nums.append(0)
+          version_code = nums[0] * 10000 + nums[1] * 100 + nums[2]
+          if version_code < 1:
+              version_code = 1
 
-      - name: Upload APKs
-        if: always()
+          def xml_escape(s):
+              return (s.replace("&", "&amp;")
+                       .replace("<", "&lt;")
+                       .replace(">", "&gt;")
+                       .replace('"', "&quot;"))
+
+          # ---- AndroidManifest.xml: android:label ----
+          manifest_path = "app/src/main/AndroidManifest.xml"
+          if not os.path.isfile(manifest_path):
+              print(f"ERROR: {manifest_path} not found", file=sys.stderr)
+              sys.exit(1)
+
+          with open(manifest_path, "r", encoding="utf-8") as f:
+              manifest = f.read()
+
+          escaped_name = xml_escape(app_name)
+
+          def patch_application_label(m):
+              tag = m.group(0)
+              if re.search(r'android:label\s*=\s*"[^"]*"', tag):
+                  return re.sub(r'android:label\s*=\s*"[^"]*"',
+                                lambda _: f'android:label="{escaped_name}"', tag, count=1)
+              return tag.replace("<application", f'<application android:label="{escaped_name}"', 1)
+
+          new_manifest, n = re.subn(r"<application\b[^>]*>", patch_application_label, manifest, count=1, flags=re.S)
+          if n == 0:
+              print("ERROR: <application> tag not found in manifest", file=sys.stderr)
+              sys.exit(1)
+
+          with open(manifest_path, "w", encoding="utf-8") as f:
+              f.write(new_manifest)
+          print(f"Patched android:label -> {app_name}")
+
+          # ---- app/build.gradle.kts: versionName / versionCode ----
+          gradle_path = "app/build.gradle.kts"
+          if not os.path.isfile(gradle_path):
+              print(f"ERROR: {gradle_path} not found", file=sys.stderr)
+              sys.exit(1)
+
+          with open(gradle_path, "r", encoding="utf-8") as f:
+              gradle = f.read()
+
+          safe_version = app_version.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$")
+
+          gradle, n_name = re.subn(r'versionName\s*=\s*"[^"]*"',
+                                   lambda _: f'versionName = "{safe_version}"', gradle)
+          gradle, n_code = re.subn(r'versionCode\s*=\s*\d+',
+                                   lambda _: f'versionCode = {version_code}', gradle)
+
+          # Insert if missing inside defaultConfig
+          if n_name == 0 or n_code == 0:
+              m = re.search(r"defaultConfig\s*\{", gradle)
+              if not m:
+                  print("ERROR: defaultConfig block not found in build.gradle.kts", file=sys.stderr)
+                  sys.exit(1)
+              insert = ""
+              if n_code == 0:
+                  insert += f"\n        versionCode = {version_code}"
+              if n_name == 0:
+                  insert += f'\n        versionName = "{safe_version}"'
+              gradle = gradle[:m.end()] + insert + gradle[m.end():]
+
+          with open(gradle_path, "w", encoding="utf-8") as f:
+              f.write(gradle)
+          print(f"Patched versionName -> {app_version}, versionCode -> {version_code}")
+          PY
+
+      - name: Inject launcher icon
+        run: |
+          # Look for build-icon.png at the repo root first, then in the project folder
+          ICON=""
+          if [ -f "$GITHUB_WORKSPACE/build-icon.png" ]; then
+            ICON="$GITHUB_WORKSPACE/build-icon.png"
+          elif [ -f "$PROJECT_DIR/build-icon.png" ]; then
+            ICON="$PROJECT_DIR/build-icon.png"
+          fi
+
+          if [ -z "$ICON" ]; then
+            echo "build-icon.png not found, skipping icon injection"
+            exit 0
+          fi
+
+          echo "Using icon: $ICON"
+          cd "$PROJECT_DIR"
+          ICON_PATH="$ICON" python3 - <<'PY'
+          import os
+          import subprocess
+          import sys
+
+          try:
+              from PIL import Image
+          except ImportError:
+              subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "pillow"])
+              from PIL import Image
+
+          sizes = {
+              "mdpi": 48,
+              "hdpi": 72,
+              "xhdpi": 96,
+              "xxhdpi": 144,
+              "xxxhdpi": 192,
+          }
+
+          src = Image.open(os.environ["ICON_PATH"]).convert("RGBA")
+          for density, px in sizes.items():
+              out_dir = f"app/src/main/res/mipmap-{density}"
+              os.makedirs(out_dir, exist_ok=True)
+              resized = src.resize((px, px), Image.LANCZOS)
+              for name in ("ic_launcher.png", "ic_launcher_round.png"):
+                  resized.save(os.path.join(out_dir, name), "PNG")
+              # Remove conflicting webp launcher icons so the PNGs are used
+              for stale in ("ic_launcher.webp", "ic_launcher_round.webp"):
+                  p = os.path.join(out_dir, stale)
+                  if os.path.exists(p):
+                      os.remove(p)
+              print(f"Wrote {px}x{px} icons to {out_dir}")
+
+          # Remove adaptive-icon XML overrides that would take precedence over the PNGs
+          for d in ("mipmap-anydpi-v26", "mipmap-anydpi"):
+              for name in ("ic_launcher.xml", "ic_launcher_round.xml"):
+                  p = os.path.join("app/src/main/res", d, name)
+                  if os.path.exists(p):
+                      os.remove(p)
+                      print(f"Removed {p}")
+          PY
+
+      - name: Build debug APK
+        run: |
+          cd "$PROJECT_DIR"
+          gradle assembleDebug --no-daemon
+
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: apks
-          path: app/build/outputs/apk/**/*.apk
-          if-no-files-found: ignore
-
-      - name: Upload reports and Room schema
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: reports
-          path: |
-            app/build/reports/**
-            app/build/test-results/**
-            app/schemas/**
-          if-no-files-found: ignore
+          name: ${{ github.event.inputs.app_name || 'Firing' }}
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
