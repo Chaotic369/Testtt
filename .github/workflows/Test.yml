@@ -207,9 +207,15 @@ jobs:
           cd "$PROJECT_DIR"
           gradle assembleDebug --no-daemon
 
+      - name: List built APKs
+        run: |
+          find "$PROJECT_DIR/app/build/outputs/apk" -name "*.apk" -print
+
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ github.event.inputs.app_name || 'Firing' }}
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/app-debug.apk
+          # The project has product flavors (play, sideload), so the APKs are named
+          # app-play-debug.apk / app-sideload-debug.apk instead of app-debug.apk.
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/**/debug/*.apk
           if-no-files-found: error
