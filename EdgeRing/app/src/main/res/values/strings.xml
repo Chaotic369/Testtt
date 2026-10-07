@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">EdgeRing</string>
+    <string name="settings_title">Settings</string>
+    <string name="version_label">Version %1$s</string>
+
+    <string name="section_permissions">Permissions</string>
+    <string name="overlay_permission_title">Display over other apps</string>
+    <string name="overlay_permission_granted">Allowed</string>
+    <string name="overlay_permission_missing">Not allowed. EdgeRing needs this to draw the edge strip and ring over other apps.</string>
+    <string name="notification_permission_title">Notifications</string>
+    <string name="notification_permission_hint">Needed to show the Stop button while EdgeRing is running.</string>
+    <string name="action_grant">Grant</string>
+    <string name="action_allow">Allow</string>
+
+    <string name="section_trigger">Edge trigger</string>
+    <string name="trigger_enabled">Edge trigger active</string>
+    <string name="trigger_hint">Touch the thin strip on the screen edge, keep your finger down, slide onto an app and let go to open it.</string>
+    <string name="side_left">Left edge</string>
+    <string name="side_right">Right edge</string>
+    <string name="latency_label">Last open latency: %1$d ms (approximate)</string>
+    <string name="latency_none">Last open latency: not measured yet</string>
+    <string name="spike_note">Early build: the grid shows the first 12 installed apps. Zones and your own shortcuts come in later versions.</string>
+
+    <string name="notif_channel_name">EdgeRing service</string>
+    <string name="notif_title">EdgeRing is active</string>
+    <string name="notif_text">The edge trigger is on.</string>
+    <string name="action_stop">Stop</string>
+
+    <string name="toast_overlay_permission_missing">Allow Display over other apps first.</string>
+    <string name="toast_launch_failed">Could not open that app.</string>
+    <string name="toast_overlay_failed">Could not show the overlay.</string>
+    <string name="toast_service_failed">Could not start EdgeRing.</string>
+    <string name="toast_settings_unavailable">Could not open the settings page.</string>
+</resources>
